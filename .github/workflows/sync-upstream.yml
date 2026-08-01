@@ -1,9 +1,13 @@
 name: Sync Upstream Source
 
 # Daily mirror of dani-garcia/vaultwarden into our own 'upstream' branch
-# (for browsability/dev builds), plus a ledger of the latest stable tag
-# and rolling HEAD sha on 'main'. image-build.yaml watches those ledger
-# files and only rebuilds what changed.
+# (for browsability + manual dev builds), plus a ledger of the latest
+# stable tag on 'main'. image-build.yaml watches UPSTREAM_VERSION and
+# rebuilds `stable` automatically when it changes.
+#
+# UPSTREAM_MASTER_SHA is also tracked here (so a manual `dev` build always
+# has an up-to-date HEAD to point at) but does NOT trigger anything on its
+# own - dev builds are workflow_dispatch only. See image-build.yaml.
 #
 # NOTE: we do NOT mirror individual release tags into this repo. The
 # build workflow checks stable tags out directly from dani-garcia's repo

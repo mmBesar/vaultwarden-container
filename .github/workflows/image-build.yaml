@@ -1,23 +1,39 @@
 name: Build and Publish Container Image
 
-# Triggered by sync-upstream.yml pushing to the watched files below.
-# Every arch builds NATIVELY on its own runner - no QEMU anywhere.
+# Triggered automatically by sync-upstream.yml whenever it detects a genuinely
+# new stable release (UPSTREAM_VERSION changes). Every arch builds NATIVELY
+# on its own runner - no QEMU anywhere.
+#
+# `dev` never builds automatically - trigger it by hand (workflow_dispatch,
+# channel: dev or both) when you actually want a rolling build. It's a
+# 3-arch, RISC-V-included rebuild off unreleased upstream code; that's not
+# something that should run unattended on every upstream commit.
 #
 # This builds upstream's own docker/Dockerfile.debian directly, unmodified -
 # it's a genuine drop-in replacement for vaultwarden/server, just published
-# multi-arch (including riscv64) and rebuilt automatically. No PUID/PGID/TZ
-# handling in the image itself - same as upstream, use `user:` and a bind
-# mount for that at the compose level (see compose.yaml).
+# multi-arch (including riscv64). No PUID/PGID/TZ handling in the image
+# itself - same as upstream, use `user:` and a bind mount for that at the
+# compose level (see compose.yaml).
 
 on:
   push:
     branches:
       - main
     paths:
-      - '.github/workflows/image-build.yaml'
+      # Only ever changes on a genuinely new stable release (see
+      # sync-upstream.yml) - this is the whole automatic trigger. No diffing
+      # of what changed, no guessing: this file changes, stable rebuilds.
       - 'UPSTREAM_VERSION'
-      - 'UPSTREAM_MASTER_SHA'
   workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Which channel(s) to build'
+        type: choice
+        options:
+          - stable
+          - dev
+          - both
+        default: stable
 
 env:
   IMAGE_NAME: ghcr.io/mmbesar/vaultwarden-container
@@ -38,7 +54,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: main
-          fetch-depth: 2
 
       - name: Determine what to build
         id: check
@@ -48,39 +63,30 @@ jobs:
           echo "major=$(echo "$VERSION" | cut -d. -f1)" >> $GITHUB_OUTPUT
           echo "minor=$(echo "$VERSION" | cut -d. -f1-2)" >> $GITHUB_OUTPUT
 
-          # workflow_dispatch always rebuilds both channels
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # dev never builds automatically - it's a rolling build off
+          # upstream's unreleased branch, and a 3-arch RISC-V-included
+          # rebuild isn't something that should run unattended every time
+          # upstream pushes a commit. Trigger it by hand (workflow_dispatch,
+          # channel: dev or both) when you actually want one.
+          if [ "${{ github.event_name }}" = "push" ]; then
             echo "build_stable=true" >> $GITHUB_OUTPUT
-            echo "build_dev=true" >> $GITHUB_OUTPUT
-            echo "Triggered manually - building both stable and dev"
+            echo "build_dev=false" >> $GITHUB_OUTPUT
+            echo "New stable release detected - building stable only"
             exit 0
           fi
 
-          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
-          echo "Changed files: $CHANGED"
-
-          BUILD_STABLE=false
-          BUILD_DEV=false
-
-          # Workflow itself changed - rebuild both channels
-          if echo "$CHANGED" | grep -q '\.github/workflows/image-build\.yaml'; then
-            BUILD_STABLE=true
-            BUILD_DEV=true
+          CHANNEL="${{ github.event.inputs.channel || 'stable' }}"
+          if [ "$CHANNEL" = "stable" ] || [ "$CHANNEL" = "both" ]; then
+            echo "build_stable=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_stable=false" >> $GITHUB_OUTPUT
           fi
-
-          # New stable release tag - rebuild stable only
-          if echo "$CHANGED" | grep -q "UPSTREAM_VERSION"; then
-            BUILD_STABLE=true
+          if [ "$CHANNEL" = "dev" ] || [ "$CHANNEL" = "both" ]; then
+            echo "build_dev=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_dev=false" >> $GITHUB_OUTPUT
           fi
-
-          # Upstream HEAD moved - rebuild dev only
-          if echo "$CHANGED" | grep -q "UPSTREAM_MASTER_SHA"; then
-            BUILD_DEV=true
-          fi
-
-          echo "build_stable=$BUILD_STABLE" >> $GITHUB_OUTPUT
-          echo "build_dev=$BUILD_DEV" >> $GITHUB_OUTPUT
-          echo "Will build stable: $BUILD_STABLE - dev: $BUILD_DEV"
+          echo "Manual run - channel: $CHANNEL"
 
   build-stable:
     name: Build stable/${{ matrix.arch }}
@@ -212,6 +218,13 @@ jobs:
         # the confirmed-safe commit for v0.35.0 - do not switch this back to
         # a version tag.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        env:
+          # Trivy defaults to pulling linux/amd64 from the registry regardless
+          # of what the tag actually contains - since these are single-arch
+          # per-arch tags (not a multi-platform index), an arm64/riscv64 tag
+          # has no amd64 child to find, and the pull fails. This makes it
+          # request the arch that tag actually is.
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
           format: sarif
@@ -222,11 +235,12 @@ jobs:
 
       - name: Upload SARIF to Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-stable-${{ matrix.arch }}
 
+  # Manual-only - see the note at the top of this file.
   build-dev:
     name: Build dev/${{ matrix.arch }}
     needs: prepare
@@ -344,6 +358,8 @@ jobs:
         # the note in scan-stable for why.
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         continue-on-error: true
+        env:
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
           image-ref: ${{ env.IMAGE_NAME }}:dev-${{ matrix.arch }}
           format: sarif
@@ -353,7 +369,7 @@ jobs:
 
       - name: Upload SARIF to Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-dev-${{ matrix.arch }}

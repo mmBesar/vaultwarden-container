@@ -31,8 +31,10 @@ three separate machines.
   their own `.dockerignore` and `docker/Dockerfile.debian`.
 - **`main`** — this repo's own files: `compose.yaml`, the two workflows,
   and two ledger files:
-  - `UPSTREAM_VERSION` — latest stable release tag
-  - `UPSTREAM_MASTER_SHA` — latest upstream commit (drives `dev` builds)
+  - `UPSTREAM_VERSION` — latest stable release tag (changing this is the
+    *only* thing that auto-triggers a build)
+  - `UPSTREAM_MASTER_SHA` — latest upstream commit, used only when you
+    manually trigger a `dev` build
 
 ## Workflows
 
@@ -40,9 +42,14 @@ three separate machines.
    `upstream` branch, mirrors the latest release tag (source only,
    stripped of `.github/`), and updates the ledger files on `main` if
    anything changed.
-2. **`image-build.yaml`** (triggered by ledger file changes) — checks out
-   upstream's source at the pinned tag (stable) or branch HEAD (dev), and
-   builds `docker/Dockerfile.debian` directly on three native runners.
+2. **`image-build.yaml`** — `stable` builds automatically, and *only*,
+   when `UPSTREAM_VERSION` changes (a genuinely new release). `dev` never
+   builds on its own — run it by hand from the Actions tab
+   (`workflow_dispatch`, `channel: dev` or `both`) when you want a rolling
+   build off unreleased upstream code. Both check out
+   `docker/Dockerfile.debian` straight from upstream and build it on three
+   native runners, no QEMU.
+
    Before a build is allowed to become the public `:latest`/`:1.37`/etc.
    tags, it has to clear two gates:
    - **Smoke test** — pulls the just-pushed per-arch image on the same
@@ -57,6 +64,7 @@ three separate machines.
 
    Only after both gates pass does the manifest job merge the per-arch
    digests into the public multi-arch tags.
+
 
 ## Security notes
 
@@ -103,7 +111,9 @@ Front it with a reverse proxy (Caddy, nginx, Traefik) for TLS.
 2. Push these files to `main`.
 3. Run `sync-upstream.yml` once manually (`workflow_dispatch`) — this
    creates the `upstream` branch and mirrors the current stable tag.
-4. `image-build.yaml` fires automatically once the ledger files update.
+4. `image-build.yaml` fires automatically once `UPSTREAM_VERSION` updates
+   — or trigger it yourself right away (Actions tab → workflow_dispatch)
+   instead of waiting.
 
 No secrets to configure — both workflows use the default `GITHUB_TOKEN`
 (`contents: write` / `packages: write`, which the repo grants by default).
