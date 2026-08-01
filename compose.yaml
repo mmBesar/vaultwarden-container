@@ -5,7 +5,7 @@ services:
     user: "${PUID}:${PGID}"        # same as upstream - no PUID/PGID env vars, just run as this uid:gid
     restart: unless-stopped
     environment:
-      DOMAIN: "https://vault.yourdomain.tld"
+      DOMAIN: "https://vaultwarden.yourdomain.tld"
       # WEBSOCKET_ENABLED: "true"
       # ADMIN_TOKEN: "${ADMIN_PASSWORD}"
       # SIGNUPS_ALLOWED: "false"
