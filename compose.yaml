@@ -1,0 +1,17 @@
+services:
+  vaultwarden:
+    image: ghcr.io/mmbesar/vaultwarden-container:latest   # drop-in for vaultwarden/server:latest
+    container_name: vaultwarden
+    user: "${PUID}:${PGID}"        # same as upstream - no PUID/PGID env vars, just run as this uid:gid
+    restart: unless-stopped
+    environment:
+      DOMAIN: "https://vault.yourdomain.tld"
+      # WEBSOCKET_ENABLED: "true"
+      # ADMIN_TOKEN: "${ADMIN_PASSWORD}"
+      # SIGNUPS_ALLOWED: "false"
+    volumes:
+      - ./vw-data:/data
+      - /etc/timezone:/etc/timezone:ro   # same as upstream - TZ via bind mount, not an env var
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "127.0.0.1:8000:80"

@@ -1,0 +1,97 @@
+name: Sync Upstream Source
+
+# Daily mirror of dani-garcia/vaultwarden into our own 'upstream' branch
+# (for browsability/dev builds), plus a ledger of the latest stable tag
+# and rolling HEAD sha on 'main'. image-build.yaml watches those ledger
+# files and only rebuilds what changed.
+#
+# NOTE: we do NOT mirror individual release tags into this repo. The
+# build workflow checks stable tags out directly from dani-garcia's repo
+# (repository: dani-garcia/vaultwarden in the checkout step), so there's
+# no need to rewrite and force-push someone else's signed tag history
+# into ours just to read it back a moment later - that was pure
+# unnecessary risk (and the source of two separate git-plumbing bugs
+# before it was removed).
+
+on:
+  schedule:
+    - cron: '15 2 * * *'  # daily at 02:15 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    name: Sync dani-garcia/vaultwarden to upstream branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/dani-garcia/vaultwarden.git
+          git fetch upstream "+refs/heads/main:refs/remotes/upstream/main" --tags --force
+
+      - name: Sync upstream branch (source only, strip upstream's own .github/)
+        run: |
+          # We deliberately drop upstream's .github/ - GITHUB_TOKEN can't
+          # push workflow file changes without the 'workflows' permission,
+          # and we don't need their CI here anyway.
+          git checkout -B upstream upstream/main
+          rm -rf .github
+          git add -A
+          git commit -m "chore: sync upstream dani-garcia/vaultwarden main $(date -u '+%Y-%m-%d')" || echo "Nothing to commit"
+          git push origin upstream --force
+
+      - name: Update ledger files on main if anything changed
+        run: |
+          git checkout main
+          git pull origin main
+
+          CHANGED=false
+
+          # ---- Stable: latest release tag ----
+          # Read straight from the fetched remote-tracking tags - no need
+          # to push any of these to our own origin.
+          LATEST_TAG=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -n "$LATEST_TAG" ]; then
+            CURRENT_VERSION=$(cat UPSTREAM_VERSION 2>/dev/null || echo "")
+            if [ "$LATEST_TAG" != "$CURRENT_VERSION" ]; then
+              echo "New stable version: $CURRENT_VERSION -> $LATEST_TAG"
+              echo "$LATEST_TAG" > UPSTREAM_VERSION
+              git add UPSTREAM_VERSION
+              CHANGED=true
+            else
+              echo "Stable version unchanged: $CURRENT_VERSION"
+            fi
+          fi
+
+          # ---- Dev: rolling upstream HEAD ----
+          MASTER_SHA=$(git rev-parse upstream/main)
+          CURRENT_SHA=$(cat UPSTREAM_MASTER_SHA 2>/dev/null || echo "")
+          if [ "$MASTER_SHA" != "$CURRENT_SHA" ]; then
+            echo "Upstream HEAD changed: $CURRENT_SHA -> $MASTER_SHA"
+            echo "$MASTER_SHA" > UPSTREAM_MASTER_SHA
+            git add UPSTREAM_MASTER_SHA
+            CHANGED=true
+          else
+            echo "Upstream HEAD unchanged: $CURRENT_SHA"
+          fi
+
+          if [ "$CHANGED" = "true" ]; then
+            git commit -m "chore: sync upstream changes $(date -u '+%Y-%m-%d')"
+            git push origin main
+          else
+            echo "Nothing changed - no push needed."
+          fi

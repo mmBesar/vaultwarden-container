@@ -1,0 +1,447 @@
+name: Build and Publish Container Image
+
+# Triggered by sync-upstream.yml pushing to the watched files below.
+# Every arch builds NATIVELY on its own runner - no QEMU anywhere.
+#
+# This builds upstream's own docker/Dockerfile.debian directly, unmodified -
+# it's a genuine drop-in replacement for vaultwarden/server, just published
+# multi-arch (including riscv64) and rebuilt automatically. No PUID/PGID/TZ
+# handling in the image itself - same as upstream, use `user:` and a bind
+# mount for that at the compose level (see compose.yaml).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/image-build.yaml'
+      - 'UPSTREAM_VERSION'
+      - 'UPSTREAM_MASTER_SHA'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/mmbesar/vaultwarden-container
+
+jobs:
+  prepare:
+    name: Prepare Build Context
+    runs-on: ubuntu-24.04
+    outputs:
+      build_stable: ${{ steps.check.outputs.build_stable }}
+      build_dev: ${{ steps.check.outputs.build_dev }}
+      version: ${{ steps.check.outputs.version }}
+      major: ${{ steps.check.outputs.major }}
+      minor: ${{ steps.check.outputs.minor }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - name: Determine what to build
+        id: check
+        run: |
+          VERSION=$(cat UPSTREAM_VERSION 2>/dev/null || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "major=$(echo "$VERSION" | cut -d. -f1)" >> $GITHUB_OUTPUT
+          echo "minor=$(echo "$VERSION" | cut -d. -f1-2)" >> $GITHUB_OUTPUT
+
+          # workflow_dispatch always rebuilds both channels
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build_stable=true" >> $GITHUB_OUTPUT
+            echo "build_dev=true" >> $GITHUB_OUTPUT
+            echo "Triggered manually - building both stable and dev"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          echo "Changed files: $CHANGED"
+
+          BUILD_STABLE=false
+          BUILD_DEV=false
+
+          # Workflow itself changed - rebuild both channels
+          if echo "$CHANGED" | grep -q '\.github/workflows/image-build\.yaml'; then
+            BUILD_STABLE=true
+            BUILD_DEV=true
+          fi
+
+          # New stable release tag - rebuild stable only
+          if echo "$CHANGED" | grep -q "UPSTREAM_VERSION"; then
+            BUILD_STABLE=true
+          fi
+
+          # Upstream HEAD moved - rebuild dev only
+          if echo "$CHANGED" | grep -q "UPSTREAM_MASTER_SHA"; then
+            BUILD_DEV=true
+          fi
+
+          echo "build_stable=$BUILD_STABLE" >> $GITHUB_OUTPUT
+          echo "build_dev=$BUILD_DEV" >> $GITHUB_OUTPUT
+          echo "Will build stable: $BUILD_STABLE - dev: $BUILD_DEV"
+
+  build-stable:
+    name: Build stable/${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.build_stable == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: riscv64
+            runner: ubuntu-24.04-riscv   # RISE native RISC-V runner - NOT QEMU
+
+    steps:
+      - name: Checkout upstream source at stable tag
+        # Straight from dani-garcia's own repo - no local tag mirror needed.
+        uses: actions/checkout@v6
+        with:
+          repository: dani-garcia/vaultwarden
+          ref: ${{ needs.prepare.outputs.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push stable/${{ matrix.arch }}
+        # context/file are upstream's own docker/Dockerfile.debian, untouched -
+        # this is exactly what `docker/bake.sh` runs locally, just wired
+        # into CI. platforms is single-arch here (one native runner per
+        # arch), so $BUILDPLATFORM == $TARGETPLATFORM and xx-cargo compiles
+        # natively - no emulation involved.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.debian
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest-${{ matrix.arch }}
+            ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.minor }}-${{ matrix.arch }}
+            ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.major }}-${{ matrix.arch }}
+          build-args: |
+            VW_VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mmBesar/vaultwarden-container
+            org.opencontainers.image.upstream=https://github.com/dani-garcia/vaultwarden
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          sbom: true
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:cache-stable-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:cache-stable-${{ matrix.arch }},mode=max
+
+      - name: Smoke test the published image
+        # Runs on the SAME native runner that just built it, so this stays
+        # true to "no QEMU anywhere" - riscv64 gets tested on real RISC-V,
+        # not emulated. Pulls the tag we just pushed (not a local layer) so
+        # this verifies exactly what's now sitting in the registry, then
+        # exercises the actual startup path via the unauthenticated
+        # liveness endpoint before anything downstream treats it as good.
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}"
+          docker pull "$IMAGE"
+          docker run -d --name smoke-test -p 8080:80 \
+            -e DOMAIN=http://localhost:8080 \
+            -e DISABLE_ADMIN_TOKEN=true \
+            -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+            "$IMAGE"
+
+          ok=false
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/alive >/dev/null 2>&1; then
+              ok=true
+              break
+            fi
+            sleep 2
+          done
+
+          docker logs smoke-test || true
+          docker rm -f smoke-test || true
+
+          if [ "$ok" != "true" ]; then
+            echo "❌ Smoke test failed - /alive never responded"
+            exit 1
+          fi
+          echo "✅ Smoke test passed"
+
+  scan-stable:
+    name: Vulnerability scan — stable/${{ matrix.arch }}
+    needs: [prepare, build-stable]
+    if: needs.prepare.outputs.build_stable == 'true'
+    runs-on: ubuntu-24.04   # scanning doesn't execute the image, so amd64 is fine for all arches
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64, riscv64]
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scan
+        # Pinned to a full commit SHA, not a version tag - aquasecurity/trivy-action
+        # had 75 of 76 version tags hijacked to serve a credential-stealer in
+        # March 2026 (CVE-2026-33634, GHSA-69fq-xp46-6x23). Tags are mutable
+        # and can be force-pushed after the fact; this SHA can't be. This is
+        # the confirmed-safe commit for v0.35.0 - do not switch this back to
+        # a version tag.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL
+          ignore-unfixed: true   # don't gate releases on CVEs with no available fix yet
+          exit-code: '1'
+
+      - name: Upload SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-stable-${{ matrix.arch }}
+
+  build-dev:
+    name: Build dev/${{ matrix.arch }}
+    needs: prepare
+    if: needs.prepare.outputs.build_dev == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: riscv64
+            runner: ubuntu-24.04-riscv   # RISE native RISC-V runner - NOT QEMU
+
+    steps:
+      - name: Checkout upstream source (rolling)
+        uses: actions/checkout@v6
+        with:
+          ref: upstream
+
+      - name: Get upstream commit SHA
+        id: sha
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dev/${{ matrix.arch }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.debian
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:dev-${{ matrix.arch }}
+          build-args: |
+            VW_VERSION=dev-${{ steps.sha.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mmBesar/vaultwarden-container
+            org.opencontainers.image.upstream=https://github.com/dani-garcia/vaultwarden
+            org.opencontainers.image.version=dev-${{ steps.sha.outputs.sha }}
+          sbom: true
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:cache-dev-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:cache-dev-${{ matrix.arch }},mode=max
+
+      - name: Smoke test the published image
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:dev-${{ matrix.arch }}"
+          docker pull "$IMAGE"
+          docker run -d --name smoke-test -p 8080:80 \
+            -e DOMAIN=http://localhost:8080 \
+            -e DISABLE_ADMIN_TOKEN=true \
+            -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+            "$IMAGE"
+
+          ok=false
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/alive >/dev/null 2>&1; then
+              ok=true
+              break
+            fi
+            sleep 2
+          done
+
+          docker logs smoke-test || true
+          docker rm -f smoke-test || true
+
+          if [ "$ok" != "true" ]; then
+            echo "❌ Smoke test failed - /alive never responded"
+            exit 1
+          fi
+          echo "✅ Smoke test passed"
+
+  scan-dev:
+    name: Vulnerability scan — dev/${{ matrix.arch }}
+    needs: [prepare, build-dev]
+    if: needs.prepare.outputs.build_dev == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64, riscv64]
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scan
+        # Informational only for dev (continue-on-error) - it's a rolling
+        # build off upstream's unreleased branch by definition, so we
+        # don't hard-gate it the way we do stable. Still SHA-pinned - see
+        # the note in scan-stable for why.
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:dev-${{ matrix.arch }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-dev-${{ matrix.arch }}
+
+  manifest-stable:
+    name: Manifest — stable
+    needs: [prepare, build-stable, scan-stable]
+    if: needs.prepare.outputs.build_stable == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create manifests
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          MINOR=${{ needs.prepare.outputs.minor }}
+          MAJOR=${{ needs.prepare.outputs.major }}
+
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            ${{ env.IMAGE_NAME }}:latest-amd64 \
+            ${{ env.IMAGE_NAME }}:latest-arm64 \
+            ${{ env.IMAGE_NAME }}:latest-riscv64
+
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:$VERSION \
+            ${{ env.IMAGE_NAME }}:$VERSION-amd64 \
+            ${{ env.IMAGE_NAME }}:$VERSION-arm64 \
+            ${{ env.IMAGE_NAME }}:$VERSION-riscv64
+
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:$MINOR \
+            ${{ env.IMAGE_NAME }}:$MINOR-amd64 \
+            ${{ env.IMAGE_NAME }}:$MINOR-arm64 \
+            ${{ env.IMAGE_NAME }}:$MINOR-riscv64
+
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:$MAJOR \
+            ${{ env.IMAGE_NAME }}:$MAJOR-amd64 \
+            ${{ env.IMAGE_NAME }}:$MAJOR-arm64 \
+            ${{ env.IMAGE_NAME }}:$MAJOR-riscv64
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}
+
+      - name: Summary
+        run: |
+          echo "### ✅ Published to GHCR" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}\` | pinned |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`${{ env.IMAGE_NAME }}:latest\` | floating |" >> $GITHUB_STEP_SUMMARY
+
+  manifest-dev:
+    name: Manifest — dev
+    needs: [prepare, build-dev, scan-dev]
+    if: needs.prepare.outputs.build_dev == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create manifest
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.IMAGE_NAME }}:dev \
+            ${{ env.IMAGE_NAME }}:dev-amd64 \
+            ${{ env.IMAGE_NAME }}:dev-arm64 \
+            ${{ env.IMAGE_NAME }}:dev-riscv64
